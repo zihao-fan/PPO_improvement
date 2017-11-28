@@ -8,14 +8,31 @@ from baselines import logger
 from collections import deque
 from baselines.common import explained_variance
 from baselines.ddpg.memory import Memory
+from baselines.ddpg.ddpg import DDPG
+from models import Actor, Critic
 
 class Model(object):
     def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
-                nsteps, ent_coef, vf_coef, max_grad_norm):
+                nsteps, ent_coef, vf_coef, max_grad_norm,
+                # ddpg related params
+                layer_norm=False, tau=0.001, normalize_returns=False, normalize_observations=True,
+                batch_size=128, critic_l2_reg=1e-3, actor_lr=1e-4, critic_lr=3e-4, popart=False, clip_norm=None, reward_scale=1.):
         sess = tf.get_default_session()
 
         act_model = policy(sess, ob_space, ac_space, nbatch_act, 1, reuse=False)
         train_model = policy(sess, ob_space, ac_space, nbatch_train, nsteps, reuse=True)
+        
+        # init DDPG
+        critic = Critic(layer_norm=layer_norm)
+        actor = Actor(ac_space.shape[-1], layer_norm=layer_norm)
+        memory = Memory(limit=int(1e6), action_shape=ac_space.shape, observation_shape=ob_space.shape)
+        ddpg_agent = DDPG(actor, critic, memory, ob_space.shape, ac_space.shape,
+                        gamma=0.99, tau=tau, normalize_returns=normalize_returns, normalize_observations=normalize_observations,
+                        batch_size=batch_size, action_noise=None, param_noise=None, critic_l2_reg=critic_l2_reg,
+                        actor_lr=actor_lr, critic_lr=critic_lr, enable_popart=popart, clip_norm=clip_norm, reward_scale=reward_scale)
+
+        ddpg_agent.initialize(sess)
+        ddpg_agent.reset()
 
         A = train_model.pdtype.sample_placeholder([None])
         ADV = tf.placeholder(tf.float32, [None])
@@ -39,7 +56,10 @@ class Model(object):
         pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
         approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - OLDNEGLOGPAC))
         clipfrac = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio - 1.0), CLIPRANGE)))
-        loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
+        # loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
+        # ----------------- DDPG -----------------
+        loss = pg_loss - entropy * ent_coef
+        # ----------------- DDPG -----------------
         with tf.variable_scope('model'):
             params = tf.trainable_variables()
         grads = tf.gradients(loss, params)
@@ -80,6 +100,7 @@ class Model(object):
         self.step = act_model.step
         self.value = act_model.value
         self.initial_state = act_model.initial_state
+        self.agent = ddpg_agent
         self.save = save
         self.load = load
         tf.global_variables_initializer().run(session=sess) #pylint: disable=E1101
@@ -104,6 +125,10 @@ class Runner(object):
         epinfos = []
         for _ in range(self.nsteps): # for iteration
             actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones)
+            # ----------------- DDPG -----------------
+            _, q = self.model.agent.pi(self.obs[0], apply_noise=False, compute_Q=True)
+            values = q[:, 0]
+            # ----------------- DDPG -----------------
             mb_obs.append(self.obs.copy())
             mb_actions.append(actions)
             mb_values.append(values)
@@ -121,7 +146,11 @@ class Runner(object):
         mb_values = np.asarray(mb_values, dtype=np.float32)
         mb_neglogpacs = np.asarray(mb_neglogpacs, dtype=np.float32)
         mb_dones = np.asarray(mb_dones, dtype=np.bool)
-        last_values = self.model.value(self.obs, self.states, self.dones)
+        # last_values = self.model.value(self.obs, self.states, self.dones) # original
+        # ----------------- DDPG -----------------
+        _, my_values = self.model.agent.pi(self.obs[0], apply_noise=False, compute_Q=True)
+        last_values = my_values[:, 0]
+        # ----------------- DDPG -----------------
         #discount/bootstrap off value fn
         mb_returns = np.zeros_like(mb_rewards)
         mb_advs = np.zeros_like(mb_rewards)
@@ -136,7 +165,7 @@ class Runner(object):
             delta = mb_rewards[t] + self.gamma * nextvalues * nextnonterminal - mb_values[t]
             mb_advs[t] = lastgaelam = delta + self.gamma * self.lam * nextnonterminal * lastgaelam
         mb_returns = mb_advs + mb_values
-        return (*map(sf01, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs)), 
+        return (*map(sf01, (mb_obs, mb_returns, mb_rewards, mb_dones, mb_actions, mb_values, mb_neglogpacs)), 
             mb_states, epinfos)
 # obs, returns, masks, actions, values, neglogpacs, states = runner.run()
 def sf01(arr):
@@ -154,7 +183,7 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr, 
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, 
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0):
+            save_interval=0, nddpgbatches=128):
 
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
@@ -170,7 +199,7 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
 
     make_model = lambda : Model(policy=policy, ob_space=ob_space, ac_space=ac_space, nbatch_act=nenvs, nbatch_train=nbatch_train, 
                     nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-                    max_grad_norm=max_grad_norm)
+                    max_grad_norm=max_grad_norm, batch_size=nddpgbatches)
     if save_interval and logger.get_dir():
         import cloudpickle
         with open(osp.join(logger.get_dir(), 'make_model.pkl'), 'wb') as fh:
@@ -189,7 +218,13 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
         frac = 1.0 - (update - 1.0) / nupdates
         lrnow = lr(frac)
         cliprangenow = cliprange(frac)
-        obs, returns, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
+        obs, returns, rewards, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
+        # print('obs.shape', obs.shape, 'rewards.shape', returns.shape, 'masks.shape', masks.shape, 'actions.shape', actions.shape)
+        # ------------------ save transitions ------------------ 
+        transitions_num = obs.shape[0]
+        for i in range(0, transitions_num - 1):
+            model.agent.store_transition(obs[i], actions[i], rewards[i], obs[i+1], masks[i+1])
+        # ------------------ save transitions ------------------ 
         epinfobuf.extend(epinfos)
         mblossvals = []
         if states is None: # nonrecurrent version
@@ -215,9 +250,22 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
                     mbflatinds = flatinds[mbenvinds].ravel()
                     slices = (arr[mbflatinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
                     mbstates = states[mbenvinds]
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))            
+                    mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))        
+
+        mbcritic_loss = []
+        mbactor_loss = []
+        # ------------- train DDPG ----------------
+        for _ in range(noptepochs * 10):
+            for _ in range(0, nbatch, nbatch_train):
+                cl, al = model.agent.train()
+                mbcritic_loss.append(cl)
+                mbactor_loss.append(al)
+                model.agent.update_target_net()
+        # ------------- train DDPG ----------------
 
         lossvals = np.mean(mblossvals, axis=0)
+        critic_loss = np.mean(mbcritic_loss)
+        actor_loss = np.mean(mbactor_loss)
         tnow = time.time()
         fps = int(nbatch / (tnow - tstart))
         if update % log_interval == 0 or update == 1:
@@ -232,6 +280,8 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             logger.logkv('time_elapsed', tnow - tfirststart)
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv(lossname, lossval)
+            logger.logkv('critic_loss', critic_loss)
+            logger.logkv('actor_loss', actor_loss)
             logger.dumpkvs()
         if save_interval and (update % save_interval == 0 or update == 1) and logger.get_dir():
             checkdir = osp.join(logger.get_dir(), 'checkpoints')
