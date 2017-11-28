@@ -16,7 +16,7 @@ class Model(object):
                 nsteps, ent_coef, vf_coef, max_grad_norm,
                 # ddpg related params
                 layer_norm=False, tau=0.001, normalize_returns=False, normalize_observations=True,
-                batch_size=128, critic_l2_reg=1e-3, actor_lr=1e-4, critic_lr=3e-4, popart=False, clip_norm=None, reward_scale=1.):
+                batch_size=128, critic_l2_reg=1e-3, actor_lr=1e-4, critic_lr=1e-3, popart=False, clip_norm=10., reward_scale=1.):
         sess = tf.get_default_session()
 
         act_model = policy(sess, ob_space, ac_space, nbatch_act, 1, reuse=False)
@@ -133,8 +133,12 @@ class Runner(object):
             mb_actions.append(actions)
             mb_values.append(values)
             mb_neglogpacs.append(neglogpacs)
-            mb_dones.append(self.dones)            
+            mb_dones.append(self.dones)
+            old_obs = self.obs.copy()[:]
             self.obs[:], rewards, self.dones, infos = self.env.step(actions)
+            # ------------------ save transitions ------------------ 
+            self.model.agent.store_transition(old_obs, actions[:], rewards, self.obs[:].copy(), self.dones.copy())
+            # ------------------ save transitions ------------------ 
             for info in infos:
                 maybeepinfo = info.get('episode')
                 if maybeepinfo: epinfos.append(maybeepinfo)
@@ -183,7 +187,7 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr, 
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, 
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, nddpgbatches=128):
+            save_interval=0, nddpgbatches=128, ddpg_steps=50, target_lag=5):
 
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
@@ -211,6 +215,7 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
     tfirststart = time.time()
 
     nupdates = total_timesteps//nbatch
+    print('nupdates', nupdates)
     for update in range(1, nupdates+1):
         assert nbatch % nminibatches == 0
         nbatch_train = nbatch // nminibatches
@@ -221,9 +226,9 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
         obs, returns, rewards, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
         # print('obs.shape', obs.shape, 'rewards.shape', returns.shape, 'masks.shape', masks.shape, 'actions.shape', actions.shape)
         # ------------------ save transitions ------------------ 
-        transitions_num = obs.shape[0]
-        for i in range(0, transitions_num - 1):
-            model.agent.store_transition(obs[i], actions[i], rewards[i], obs[i+1], masks[i+1])
+        # transitions_num = obs.shape[0]
+        # for i in range(0, transitions_num - 1):
+        #     model.agent.store_transition(obs[i], actions[i], rewards[i], obs[i+1], masks[i+1])
         # ------------------ save transitions ------------------ 
         epinfobuf.extend(epinfos)
         mblossvals = []
@@ -255,12 +260,13 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
         mbcritic_loss = []
         mbactor_loss = []
         # ------------- train DDPG ----------------
-        for _ in range(noptepochs * 10):
-            for _ in range(0, nbatch, nbatch_train):
-                cl, al = model.agent.train()
-                mbcritic_loss.append(cl)
-                mbactor_loss.append(al)
+        for _ in range(ddpg_steps):
+            cl, al = model.agent.train()
+            mbcritic_loss.append(cl)
+            mbactor_loss.append(al)
+            if update > target_lag:
                 model.agent.update_target_net()
+        # print('noptepochs', noptepochs, 'nbatch_train', nbatch_train, 'nbatch', nbatch)
         # ------------- train DDPG ----------------
 
         lossvals = np.mean(mblossvals, axis=0)
