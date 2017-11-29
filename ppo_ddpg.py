@@ -12,6 +12,9 @@ from baselines.ddpg.ddpg import DDPG
 from models import Actor, Critic
 
 use_ddpg = True
+use_annealing = True
+if not use_ddpg:
+    use_annealing = False
 
 class Model(object):
     def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
@@ -43,6 +46,9 @@ class Model(object):
         OLDVPRED = tf.placeholder(tf.float32, [None])
         LR = tf.placeholder(tf.float32, [])
         CLIPRANGE = tf.placeholder(tf.float32, [])
+        if use_annealing:
+            DDPG_AC = tf.placeholder(tf.float32, (None,)+ac_space.shape)
+            DDPG_W = tf.placeholder(tf.float32, [])
 
         neglogpac = train_model.pd.neglogp(A)
         entropy = tf.reduce_mean(train_model.pd.entropy())
@@ -58,10 +64,16 @@ class Model(object):
         pg_loss = tf.reduce_mean(tf.maximum(pg_losses, pg_losses2))
         approxkl = .5 * tf.reduce_mean(tf.square(neglogpac - OLDNEGLOGPAC))
         clipfrac = tf.reduce_mean(tf.to_float(tf.greater(tf.abs(ratio - 1.0), CLIPRANGE)))
+
+        if use_annealing:
+            pi_mean = train_model.pi
+            ac_loss = tf.reduce_mean(tf.square(pi_mean - DDPG_AC))
         # loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
         # ----------------- DDPG -----------------
         if use_ddpg:
             loss = pg_loss - entropy * ent_coef
+            if use_annealing:
+                loss = pg_loss - entropy * ent_coef + ac_loss * DDPG_W
         else:
             loss = pg_loss - entropy * ent_coef + vf_loss * vf_coef
         # ----------------- DDPG -----------------
@@ -74,20 +86,33 @@ class Model(object):
         trainer = tf.train.AdamOptimizer(learning_rate=LR, epsilon=1e-5)
         _train = trainer.apply_gradients(grads)
 
-        def train(lr, cliprange, obs, returns, masks, actions, values, neglogpacs, states=None):
+        def train(lr, cliprange, obs, returns, masks, actions, values, neglogpacs, states=None, ddpg_acs=None, ddpg_w=0.):
             advs = returns - values
             advs = (advs - advs.mean()) / (advs.std() + 1e-8)
-            td_map = {train_model.X:obs, A:actions, ADV:advs, R:returns, LR:lr, 
-                    CLIPRANGE:cliprange, OLDNEGLOGPAC:neglogpacs, OLDVPRED:values}
+            if not use_annealing:
+                td_map = {train_model.X:obs, A:actions, ADV:advs, R:returns, LR:lr, 
+                        CLIPRANGE:cliprange, OLDNEGLOGPAC:neglogpacs, OLDVPRED:values}
+            else:
+                td_map = {train_model.X:obs, A:actions, ADV:advs, R:returns, LR:lr, 
+                        CLIPRANGE:cliprange, OLDNEGLOGPAC:neglogpacs, OLDVPRED:values,
+                        DDPG_AC:ddpg_acs, DDPG_W:ddpg_w}
             if states is not None:
                 td_map[train_model.S] = states
                 td_map[train_model.M] = masks
-            return sess.run(
-                [pg_loss, vf_loss, entropy, approxkl, clipfrac, _train],
-                td_map
-            )[:-1]
-        self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
-
+            if not use_annealing:
+                return sess.run(
+                    [pg_loss, vf_loss, entropy, approxkl, clipfrac, _train],
+                    td_map
+                )[:-1]
+            else:
+                return sess.run(
+                    [pg_loss, vf_loss, entropy, approxkl, clipfrac, ac_loss, _train],
+                    td_map
+                )[:-1]
+        if not use_annealing:
+            self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac']
+        else:
+            self.loss_names = ['policy_loss', 'value_loss', 'policy_entropy', 'approxkl', 'clipfrac', 'ac_loss']
         def save(save_path):
             ps = sess.run(params)
             joblib.dump(ps, save_path)
@@ -195,7 +220,8 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr, 
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, 
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, nddpgbatches=32, ddpg_steps=500, target_lag=1):
+            save_interval=0, nddpgbatches=32, ddpg_steps=500, target_lag=0,
+            ddpg_ac_weight=0.0, annealing_updates=50):
 
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
@@ -224,8 +250,11 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
 
     nupdates = total_timesteps//nbatch
     print('nupdates', nupdates)
+    ddpg_w = ddpg_ac_weight if use_annealing else 0.0
     for update in range(1, nupdates+1):
         assert nbatch % nminibatches == 0
+        if ddpg_w > 0.0:
+            ddpg_w -= 1/float(annealing_updates) * ddpg_w
         values_list = []
         nbatch_train = nbatch // nminibatches
         tstart = time.time()
@@ -233,6 +262,12 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
         lrnow = lr(frac)
         cliprangenow = cliprange(frac)
         obs, returns, rewards, masks, actions, values, neglogpacs, states, epinfos = runner.run() #pylint: disable=E0632
+        if use_annealing:
+            ddpg_ac_list = []
+            for idx in range(obs.shape[0]):
+                ddpg_ac, _ = model.agent.pi(obs[idx], apply_noise=False, compute_Q=False)
+                ddpg_ac_list.append(ddpg_ac)
+            ddpg_ac = np.asarray(ddpg_ac_list)
         values_list.append(values)
         # print('obs.shape', obs.shape, 'rewards.shape', returns.shape, 'masks.shape', masks.shape, 'actions.shape', actions.shape)
         epinfobuf.extend(epinfos)
@@ -245,7 +280,10 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
                     end = start + nbatch_train
                     mbinds = inds[start:end]
                     slices = (arr[mbinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices))
+                    if not use_annealing:
+                        mblossvals.append(model.train(lrnow, cliprangenow, *slices))
+                    else:
+                        mblossvals.append(model.train(lrnow, cliprangenow, *slices, ddpg_acs=ddpg_ac[mbinds], ddpg_w=ddpg_w))
         else: # recurrent version
             assert nenvs % nminibatches == 0
             envsperbatch = nenvs // nminibatches
@@ -260,7 +298,11 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
                     mbflatinds = flatinds[mbenvinds].ravel()
                     slices = (arr[mbflatinds] for arr in (obs, returns, masks, actions, values, neglogpacs))
                     mbstates = states[mbenvinds]
-                    mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))        
+                    # mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))
+                    if not use_annealing:
+                        mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates))
+                    else:
+                        mblossvals.append(model.train(lrnow, cliprangenow, *slices, mbstates, ddpg_acs=ddpg_ac[mbinds], ddpg_w=ddpg_w))        
 
         if use_ddpg:
             mbcritic_loss = []
