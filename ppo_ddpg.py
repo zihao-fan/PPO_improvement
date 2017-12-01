@@ -12,7 +12,7 @@ from baselines.ddpg.ddpg import DDPG
 from models import Actor, Critic
 
 use_ddpg = True
-use_annealing = True
+use_annealing = False
 if not use_ddpg:
     use_annealing = False
 
@@ -220,7 +220,7 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr, 
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, 
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, nddpgbatches=32, ddpg_steps=500, target_lag=1,
+            save_interval=0, nddpgbatches=32, ddpg_steps=2000, target_lag=1,
             ddpg_ac_weight=0.1, annealing_updates=50):
 
     if isinstance(lr, float): lr = constfn(lr)
