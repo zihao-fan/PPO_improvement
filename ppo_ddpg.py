@@ -30,7 +30,7 @@ class Model(object):
         # init DDPG
         critic = Critic(layer_norm=layer_norm)
         actor = Actor(ac_space.shape[-1], layer_norm=layer_norm)
-        memory = Memory(limit=int(1e5), action_shape=ac_space.shape, observation_shape=ob_space.shape)
+        memory = Memory(limit=int(1e6), action_shape=ac_space.shape, observation_shape=ob_space.shape)
         ddpg_agent = DDPG(actor, critic, memory, ob_space.shape, ac_space.shape,
                         gamma=0.99, tau=tau, normalize_returns=normalize_returns, normalize_observations=normalize_observations,
                         batch_size=batch_size, action_noise=None, param_noise=None, critic_l2_reg=critic_l2_reg,
@@ -219,10 +219,13 @@ def constfn(val):
 
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr, 
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95, 
-            log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, nddpgbatches=32, ddpg_steps=2000, target_lag=1,
-            ddpg_ac_weight=0.1, annealing_updates=50):
-
+            log_interval=10, nminibatches=16, noptepochs=4, cliprange=0.2,
+            save_interval=0, nddpgbatches=32, ddpg_per_ppo=128, target_lag=1,
+            ddpg_ac_weight=0.1, annealing_updates=50, with_ddpg=True, with_annealing=True):
+    global use_ddpg
+    global use_annealing
+    use_ddpg = with_ddpg
+    use_annealing = with_annealing
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
     if isinstance(cliprange, float): cliprange = constfn(cliprange)
@@ -308,7 +311,7 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             mbcritic_loss = []
             mbactor_loss = []
             # ------------- train DDPG ----------------
-            for _ in range(ddpg_steps):
+            for _ in range(ddpg_per_ppo * noptepochs * nminibatches):
                 cl, al = model.agent.train()
                 mbcritic_loss.append(cl)
                 mbactor_loss.append(al)
@@ -335,6 +338,9 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             logger.logkv('eplenmean', safemean([epinfo['l'] for epinfo in epinfobuf]))
             logger.logkv('time_elapsed', tnow - tfirststart)
             logger.logkv('value estimation', values_avg)
+            logger.logkv('eprew_max', np.max(mblossvals))
+            logger.logkv('eprew_min', np.min(mblossvals))
+            logger.logkv('eprew_std', np.std(mblossvals))
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv(lossname, lossval)
             if use_ddpg:

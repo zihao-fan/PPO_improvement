@@ -10,7 +10,7 @@ def train(env_id, num_timesteps, seed):
     import gym
     import tensorflow as tf
     from baselines.common.vec_env.dummy_vec_env import DummyVecEnv
-    ncpu = 1
+    ncpu = 4
     config = tf.ConfigProto(allow_soft_placement=True,
                             intra_op_parallelism_threads=ncpu,
                             inter_op_parallelism_threads=ncpu)
@@ -26,7 +26,7 @@ def train(env_id, num_timesteps, seed):
     policy = MlpPolicy
     ppo_ddpg.learn(policy=policy, env=env, nsteps=2048, nminibatches=32,
         lam=0.95, gamma=0.99, noptepochs=10, log_interval=1,
-        ent_coef=0.0,
+        ent_coef=1e-4,
         lr=3e-4,
         cliprange=0.2,
         total_timesteps=num_timesteps)
